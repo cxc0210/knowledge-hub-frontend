@@ -1,12 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { LayoutDashboard, Users } from "lucide-react";
+import { usePathname, useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { FileText, LayoutDashboard, Search, Users } from "lucide-react";
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import type { CurrentUser } from "@/lib/auth";
 import { cn } from "@/lib/utils";
+import { HttpError, httpService } from "@/services/http";
 
 import { LogoutButton } from "./logout-button";
 
@@ -17,16 +19,72 @@ const navigation = [
     icon: LayoutDashboard,
   },
   {
+    href: "/search",
+    label: "搜索",
+    icon: Search,
+  },
+  {
+    href: "/document",
+    label: "文档管理",
+    icon: FileText,
+  },
+  {
     href: "/user",
     label: "用户管理",
     icon: Users,
   },
 ];
 
-export function Sidebar({ user }: { user: CurrentUser | null }) {
+export function Sidebar() {
   const pathname = usePathname();
-  const displayName = user?.username ?? "Knowledge User";
-  const subtitle = user?.role.name ?? user?.email ?? "已登录";
+  const router = useRouter();
+  const [user, setUser] = useState<CurrentUser | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let isActive = true;
+
+    async function loadCurrentUser() {
+      try {
+        const currentUser = await httpService.get<CurrentUser>("auth/me", {
+          signal: controller.signal,
+        });
+
+        if (isActive) {
+          setUser(currentUser);
+        }
+      } catch (error) {
+        if (!isActive) {
+          return;
+        }
+
+        if (error instanceof HttpError && error.status === 401) {
+          await httpService.post<void>("auth/logout").catch(() => undefined);
+          router.replace("/login");
+          router.refresh();
+        }
+      } finally {
+        if (isActive) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    void loadCurrentUser();
+
+    return () => {
+      isActive = false;
+      controller.abort();
+    };
+  }, [router]);
+
+  const displayName = isLoading
+    ? "加载中..."
+    : (user?.username ?? "Knowledge User");
+  const subtitle = isLoading
+    ? "正在获取用户信息"
+    : (user?.role.name ?? user?.email ?? "已登录");
 
   return (
     <aside className="sticky top-0 flex h-svh w-[68px] shrink-0 flex-col items-center bg-sidebar px-[9px] py-4 text-sidebar-foreground sm:w-[82px] sm:px-[13px] sm:py-[22px] lg:w-[264px] lg:items-stretch lg:px-5 lg:pt-7 lg:pb-5">
@@ -51,7 +109,8 @@ export function Sidebar({ user }: { user: CurrentUser | null }) {
           工作台
         </p>
         {navigation.map((item) => {
-          const isActive = pathname === item.href;
+          const isActive =
+            pathname === item.href || pathname.startsWith(`${item.href}/`);
           const Icon = item.icon;
 
           return (
