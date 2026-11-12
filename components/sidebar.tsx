@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { FileText, LayoutDashboard, Search, Users } from "lucide-react";
+import { Bot, FileText, LayoutDashboard, Search, Users } from "lucide-react";
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import type { CurrentUser } from "@/lib/auth";
@@ -17,6 +17,11 @@ const navigation = [
     href: "/dashboard",
     label: "仪表盘",
     icon: LayoutDashboard,
+  },
+  {
+    href: "/ask",
+    label: "AI智能问答",
+    icon: Bot,
   },
   {
     href: "/search",

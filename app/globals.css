@@ -98,7 +98,8 @@
 }
 
 main:has(> [data-user-page]),
-main:has(> [data-document-page]) {
+main:has(> [data-document-page]),
+main:has(> [data-ask-page]) {
   height: 100svh;
   overflow: hidden;
 }
