@@ -48,7 +48,7 @@ export async function proxyBackendRequest(request: NextRequest, path: string[]) 
 
     const response = new NextResponse(
       canHaveResponseBody(request.method, backendResponse.status)
-        ? await backendResponse.arrayBuffer()
+        ? backendResponse.body
         : null,
       {
         status: backendResponse.status,

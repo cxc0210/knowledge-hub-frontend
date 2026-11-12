@@ -27,6 +27,48 @@ class HttpService {
     return this.request<T>(path, { ...options, method: "POST", body });
   }
 
+  async postStream(
+    path: string,
+    body?: unknown,
+    options?: RequestOptions,
+  ): Promise<ReadableStream<Uint8Array>> {
+    const headers = new Headers(options?.headers);
+    const hasBody = body !== undefined;
+
+    if (hasBody && !headers.has("content-type")) {
+      headers.set("content-type", "application/json");
+    }
+
+    let response: Response;
+
+    try {
+      response = await fetch(this.resolveUrl(path), {
+        ...options,
+        method: "POST",
+        headers,
+        credentials: "same-origin",
+        body: hasBody ? JSON.stringify(body) : undefined,
+      });
+    } catch (error) {
+      throw new HttpError("暂时无法连接服务，请稍后重试", 0, error);
+    }
+
+    if (!response.ok) {
+      const payload = await this.parseResponse(response);
+      throw new HttpError(
+        this.getErrorMessage(payload, response.status),
+        response.status,
+        payload,
+      );
+    }
+
+    if (!response.body) {
+      throw new HttpError("服务未返回可读取的响应流", response.status, null);
+    }
+
+    return response.body;
+  }
+
   put<T>(path: string, body?: unknown, options?: RequestOptions) {
     return this.request<T>(path, { ...options, method: "PUT", body });
   }
