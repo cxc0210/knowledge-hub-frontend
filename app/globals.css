@@ -2,6 +2,8 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 
+@source "../node_modules/streamdown/dist/*.js";
+
 @custom-variant dark (&:is(.dark *));
 
 :root {
@@ -324,4 +326,32 @@ main:has(> [data-ask-page]) {
 
 .ai-markdown pre {
   padding: 0.8rem;
+}
+
+.ai-markdown [data-streamdown="code-block"] {
+  border-color: #dce3dc;
+  background: #f3f6f1;
+  box-shadow: 0 8px 24px rgb(23 34 29 / 6%);
+}
+
+.ai-markdown [data-streamdown="code-block-header"] {
+  color: #68746d;
+}
+
+.ai-markdown [data-streamdown="code-block-actions"] {
+  border-color: #dce3dc;
+  background: rgb(255 255 255 / 88%);
+  color: #68746d;
+}
+
+.ai-markdown [data-streamdown="code-block-body"] {
+  border-color: #dce3dc;
+  background: #ffffff;
+}
+
+.ai-markdown [data-streamdown="code-block-body"] pre {
+  margin: 0;
+  background: transparent;
+  padding: 0;
+  color: #26312b;
 }

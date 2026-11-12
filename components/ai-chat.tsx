@@ -1,8 +1,8 @@
 "use client";
 
-import { Bot, LoaderCircle, Send, UserRound } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { useChat } from "@ai-sdk/react";
+import { DefaultChatTransport, type UIMessage } from "ai";
+import { Bot, LoaderCircle, Send, Square, UserRound } from "lucide-react";
 import {
   FormEvent,
   KeyboardEvent,
@@ -10,62 +10,63 @@ import {
   useRef,
   useState,
 } from "react";
+import { Streamdown } from "streamdown";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { AIStreamError, readAIChatStream } from "@/lib/ai";
 import { cn } from "@/lib/utils";
-import { HttpError, httpService } from "@/services/http";
 
-type ChatMessage = {
-  id: number;
-  role: "user" | "assistant";
-  content: string;
-  isStreaming?: boolean;
-};
-
-const INITIAL_MESSAGES: ChatMessage[] = [
+const INITIAL_MESSAGES: UIMessage[] = [
   {
-    id: 1,
+    id: "welcome",
     role: "assistant",
-    content: "你好，我是 Knowledge Hub AI。有什么问题想问我？",
+    parts: [
+      {
+        type: "text",
+        text: "你好，我是 Knowledge Hub AI。有什么问题想问我？",
+      },
+    ],
   },
 ];
 
-const STREAM_RENDER_INTERVAL_MS = 45;
+const CHAT_TRANSPORT = new DefaultChatTransport<UIMessage>({
+  api: "/api/ai/chat/stream",
+  credentials: "same-origin",
+  prepareSendMessagesRequest({ messages }) {
+    let prompt = "";
 
-function getStreamBatchSize(queueLength: number) {
-  if (queueLength <= 4) {
-    return queueLength;
-  }
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
 
-  return Math.min(18, Math.max(2, Math.ceil(queueLength * 0.2)));
-}
-
-function waitForStreamRenderTick(signal: AbortSignal) {
-  return new Promise<void>((resolve) => {
-    const timeout = window.setTimeout(finish, STREAM_RENDER_INTERVAL_MS);
-
-    function finish() {
-      window.clearTimeout(timeout);
-      signal.removeEventListener("abort", finish);
-      resolve();
+      if (message.role === "user") {
+        prompt = message.parts
+          .map((part) => (part.type === "text" ? part.text : ""))
+          .join("");
+        break;
+      }
     }
 
-    signal.addEventListener("abort", finish, { once: true });
-  });
+    return { body: { prompt } };
+  },
+});
+
+function getMessageText(message: UIMessage) {
+  return message.parts
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("");
 }
 
 export function AIChat() {
-  const [messages, setMessages] = useState<ChatMessage[]>(INITIAL_MESSAGES);
   const [prompt, setPrompt] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [isSending, setIsSending] = useState(false);
-  const messageIdRef = useRef(INITIAL_MESSAGES.length + 1);
-  const controllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
+  const { messages, sendMessage, status, error, stop, clearError } = useChat({
+    messages: INITIAL_MESSAGES,
+    transport: CHAT_TRANSPORT,
+    throttle: 45,
+  });
+  const isSending = status === "submitted" || status === "streaming";
 
   useEffect(() => {
     if (shouldAutoScrollRef.current) {
@@ -74,12 +75,10 @@ export function AIChat() {
   }, [messages, isSending]);
 
   useEffect(() => {
-    return () => {
-      const controller = controllerRef.current;
-      controllerRef.current = null;
-      controller?.abort();
-    };
-  }, []);
+    if (!isSending) {
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    }
+  }, [isSending]);
 
   async function sendPrompt() {
     const question = prompt.trim();
@@ -88,116 +87,10 @@ export function AIChat() {
       return;
     }
 
-    const userMessage: ChatMessage = {
-      id: messageIdRef.current++,
-      role: "user",
-      content: question,
-    };
-    const assistantMessage: ChatMessage = {
-      id: messageIdRef.current++,
-      role: "assistant",
-      content: "",
-      isStreaming: true,
-    };
-    const controller = new AbortController();
-    let receivedContent = "";
-    let displayedContent = "";
-    let streamFinished = false;
-    const renderState: { wake: (() => void) | null } = { wake: null };
-    const displayQueue: string[] = [];
-    let renderTask: Promise<void> | null = null;
-    controllerRef.current = controller;
     shouldAutoScrollRef.current = true;
-    setMessages((current) => [...current, userMessage, assistantMessage]);
     setPrompt("");
-    setError(null);
-    setIsSending(true);
-
-    try {
-      const stream = await httpService.postStream(
-        "ai/chat/stream",
-        { prompt: question },
-        { signal: controller.signal },
-      );
-
-      renderTask = (async () => {
-        while (
-          !controller.signal.aborted &&
-          (!streamFinished || displayQueue.length > 0)
-        ) {
-          if (!displayQueue.length) {
-            await new Promise<void>((resolve) => {
-              renderState.wake = resolve;
-            });
-            continue;
-          }
-
-          const nextText = displayQueue
-            .splice(0, getStreamBatchSize(displayQueue.length))
-            .join("");
-          displayedContent += nextText;
-          setMessages((current) =>
-            current.map((message) =>
-              message.id === assistantMessage.id
-                ? { ...message, content: message.content + nextText }
-                : message,
-            ),
-          );
-          await waitForStreamRenderTick(controller.signal);
-        }
-      })();
-
-      try {
-        await readAIChatStream(stream, (token) => {
-          receivedContent += token;
-          displayQueue.push(...Array.from(token));
-          renderState.wake?.();
-          renderState.wake = null;
-        });
-      } finally {
-        streamFinished = true;
-        renderState.wake?.();
-        renderState.wake = null;
-      }
-
-      await renderTask;
-
-      if (!receivedContent) {
-        throw new AIStreamError("模型没有返回内容，请重试");
-      }
-    } catch (requestError) {
-      streamFinished = true;
-      renderState.wake?.();
-      renderState.wake = null;
-      await renderTask;
-
-      if (!controller.signal.aborted) {
-        if (!displayedContent) {
-          setMessages((current) =>
-            current.filter((message) => message.id !== assistantMessage.id),
-          );
-        }
-        setError(
-          requestError instanceof HttpError ||
-            requestError instanceof AIStreamError
-            ? requestError.message
-            : "发送失败，请稍后重试",
-        );
-      }
-    } finally {
-      if (controllerRef.current === controller) {
-        controllerRef.current = null;
-        setMessages((current) =>
-          current.map((message) =>
-            message.id === assistantMessage.id
-              ? { ...message, isStreaming: false }
-              : message,
-          ),
-        );
-        setIsSending(false);
-        requestAnimationFrame(() => textareaRef.current?.focus());
-      }
-    }
+    clearError();
+    await sendMessage({ text: question });
   }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -229,9 +122,13 @@ export function AIChat() {
           shouldAutoScrollRef.current = distanceFromBottom < 80;
         }}
       >
-        {messages.map((message) => {
+        {messages.map((message, index) => {
           const isUser = message.role === "user";
           const Icon = isUser ? UserRound : Bot;
+          const content = getMessageText(message);
+          const isLastMessage = index === messages.length - 1;
+          const isStreamingMessage =
+            !isUser && isLastMessage && status === "streaming";
 
           return (
             <div
@@ -261,15 +158,19 @@ export function AIChat() {
                 )}
               >
                 {isUser ? (
-                  message.content
-                ) : message.content ? (
-                  <article className="markdown-preview ai-markdown">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {message.content}
-                    </ReactMarkdown>
-                  </article>
+                  content
+                ) : content ? (
+                  <Streamdown
+                    animated
+                    caret="circle"
+                    className="markdown-preview ai-markdown"
+                    isAnimating={isStreamingMessage}
+                    mode={isStreamingMessage ? "streaming" : "static"}
+                  >
+                    {content}
+                  </Streamdown>
                 ) : null}
-                {message.isStreaming && !message.content ? (
+                {isStreamingMessage && !content ? (
                   <span className="flex items-center gap-2 text-muted-foreground">
                     <LoaderCircle className="size-4 animate-spin" />
                     正在思考...
@@ -280,6 +181,18 @@ export function AIChat() {
           );
         })}
 
+        {status === "submitted" ? (
+          <div className="flex max-w-[78%] items-start gap-3">
+            <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-accent text-accent-foreground">
+              <Bot className="size-4" />
+            </span>
+            <div className="flex h-12 items-center gap-2 rounded-2xl rounded-tl-sm bg-muted px-5 text-sm text-muted-foreground">
+              <LoaderCircle className="size-4 animate-spin" />
+              正在思考...
+            </div>
+          </div>
+        ) : null}
+
         <div ref={messagesEndRef} />
       </div>
 
@@ -289,7 +202,7 @@ export function AIChat() {
       >
         {error ? (
           <p className="mb-2 px-1 text-sm text-destructive" role="alert">
-            {error}
+            {error.message || "发送失败，请稍后重试"}
           </p>
         ) : null}
 
@@ -308,14 +221,15 @@ export function AIChat() {
             autoFocus
           />
           <Button
-            type="submit"
+            type={isSending ? "button" : "submit"}
             size="icon-lg"
             className="mb-0.5 rounded-xl"
-            disabled={!prompt.trim() || isSending}
-            aria-label="发送问题"
+            disabled={!isSending && !prompt.trim()}
+            onClick={isSending ? () => void stop() : undefined}
+            aria-label={isSending ? "停止生成" : "发送问题"}
           >
             {isSending ? (
-              <LoaderCircle className="animate-spin" />
+              <Square className="size-3.5 fill-current" />
             ) : (
               <Send />
             )}

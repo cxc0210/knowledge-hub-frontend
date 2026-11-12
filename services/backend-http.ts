@@ -39,6 +39,7 @@ export async function proxyBackendRequest(request: NextRequest, path: string[]) 
       headers: requestHeaders,
       body: canHaveBody(request.method) ? await request.arrayBuffer() : undefined,
       redirect: "manual",
+      signal: request.signal,
     });
     const responseHeaders = new Headers(backendResponse.headers);
 
