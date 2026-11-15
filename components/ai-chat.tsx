@@ -21,9 +21,11 @@ import {
 } from "react";
 import { Streamdown } from "streamdown";
 
+import { EmailApprovalCard } from "@/components/email-approval-card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { useSpeechPlayback } from "@/hooks/use-speech-playback";
+import type { EmailAction } from "@/lib/ai-actions";
 import { transcribeAudio } from "@/lib/speech";
 import { cn } from "@/lib/utils";
 
@@ -35,7 +37,13 @@ const RECORDING_MIME_TYPES = [
   "audio/ogg;codecs=opus",
 ];
 
-const INITIAL_MESSAGES: UIMessage[] = [
+type AIChatDataParts = {
+  "email-approval": EmailAction;
+};
+
+type AIChatMessage = UIMessage<unknown, AIChatDataParts>;
+
+const INITIAL_MESSAGES: AIChatMessage[] = [
   {
     id: "welcome",
     role: "assistant",
@@ -48,7 +56,7 @@ const INITIAL_MESSAGES: UIMessage[] = [
   },
 ];
 
-const CHAT_TRANSPORT = new DefaultChatTransport<UIMessage>({
+const CHAT_TRANSPORT = new DefaultChatTransport<AIChatMessage>({
   api: "/api/ai/chat/stream",
   credentials: "same-origin",
   prepareSendMessagesRequest({ messages, body }) {
@@ -69,7 +77,7 @@ const CHAT_TRANSPORT = new DefaultChatTransport<UIMessage>({
   },
 });
 
-function getMessageText(message: UIMessage) {
+function getMessageText(message: AIChatMessage) {
   return message.parts
     .map((part) => (part.type === "text" ? part.text : ""))
     .join("");
@@ -81,6 +89,9 @@ export function AIChat() {
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [speechError, setSpeechError] = useState<string | null>(null);
+  const [emailActionOverrides, setEmailActionOverrides] = useState<
+    Record<string, EmailAction>
+  >({});
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -98,11 +109,12 @@ export function AIChat() {
     stopPlayback,
     toggleEnabled: toggleSpeechPlayback,
   } = useSpeechPlayback();
-  const { messages, sendMessage, status, error, stop, clearError } = useChat({
-    messages: INITIAL_MESSAGES,
-    transport: CHAT_TRANSPORT,
-    throttle: 45,
-  });
+  const { messages, sendMessage, status, error, stop, clearError } =
+    useChat<AIChatMessage>({
+      messages: INITIAL_MESSAGES,
+      transport: CHAT_TRANSPORT,
+      throttle: 45,
+    });
   const isSending = status === "submitted" || status === "streaming";
 
   useEffect(() => {
@@ -361,6 +373,9 @@ export function AIChat() {
           const isUser = message.role === "user";
           const Icon = isUser ? UserRound : Bot;
           const content = getMessageText(message);
+          const emailApprovalParts = message.parts.filter(
+            (part) => part.type === "data-email-approval",
+          );
           const isLastMessage = index === messages.length - 1;
           const isStreamingMessage =
             !isUser && isLastMessage && status === "streaming";
@@ -405,6 +420,24 @@ export function AIChat() {
                     {content}
                   </Streamdown>
                 ) : null}
+                {!isUser
+                  ? emailApprovalParts.map((part) => {
+                      const action =
+                        emailActionOverrides[part.data.id] ?? part.data;
+                      return (
+                        <EmailApprovalCard
+                          key={action.id}
+                          action={action}
+                          onChange={(updatedAction) =>
+                            setEmailActionOverrides((current) => ({
+                              ...current,
+                              [updatedAction.id]: updatedAction,
+                            }))
+                          }
+                        />
+                      );
+                    })
+                  : null}
                 {isStreamingMessage && !content ? (
                   <span className="flex items-center gap-2 text-muted-foreground">
                     <LoaderCircle className="size-4 animate-spin" />
