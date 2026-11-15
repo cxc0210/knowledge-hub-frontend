@@ -2,7 +2,16 @@
 
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
-import { Bot, LoaderCircle, Send, Square, UserRound } from "lucide-react";
+import {
+  Bot,
+  LoaderCircle,
+  Mic,
+  Send,
+  Square,
+  UserRound,
+  Volume2,
+  VolumeX,
+} from "lucide-react";
 import {
   FormEvent,
   KeyboardEvent,
@@ -14,7 +23,17 @@ import { Streamdown } from "streamdown";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { useSpeechPlayback } from "@/hooks/use-speech-playback";
+import { transcribeAudio } from "@/lib/speech";
 import { cn } from "@/lib/utils";
+
+const MAX_RECORDING_SECONDS = 5 * 60;
+const RECORDING_MIME_TYPES = [
+  "audio/webm;codecs=opus",
+  "audio/webm",
+  "audio/mp4",
+  "audio/ogg;codecs=opus",
+];
 
 const INITIAL_MESSAGES: UIMessage[] = [
   {
@@ -32,7 +51,7 @@ const INITIAL_MESSAGES: UIMessage[] = [
 const CHAT_TRANSPORT = new DefaultChatTransport<UIMessage>({
   api: "/api/ai/chat/stream",
   credentials: "same-origin",
-  prepareSendMessagesRequest({ messages }) {
+  prepareSendMessagesRequest({ messages, body }) {
     let prompt = "";
 
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -46,7 +65,7 @@ const CHAT_TRANSPORT = new DefaultChatTransport<UIMessage>({
       }
     }
 
-    return { body: { prompt } };
+    return { body: { ...body, prompt } };
   },
 });
 
@@ -58,9 +77,27 @@ function getMessageText(message: UIMessage) {
 
 export function AIChat() {
   const [prompt, setPrompt] = useState("");
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [speechError, setSpeechError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<number | null>(null);
+  const shouldTranscribeRef = useRef(false);
+  const submitPendingRef = useRef(false);
+  const {
+    enabled: speechPlaybackEnabled,
+    status: speechPlaybackStatus,
+    error: speechPlaybackError,
+    preparePlayback,
+    stopPlayback,
+    toggleEnabled: toggleSpeechPlayback,
+  } = useSpeechPlayback();
   const { messages, sendMessage, status, error, stop, clearError } = useChat({
     messages: INITIAL_MESSAGES,
     transport: CHAT_TRANSPORT,
@@ -80,17 +117,67 @@ export function AIChat() {
     }
   }, [isSending]);
 
+  useEffect(() => {
+    return () => {
+      shouldTranscribeRef.current = false;
+
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== "inactive") {
+        recorder.onstop = null;
+        recorder.stop();
+      }
+
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+
+      if (recordingTimerRef.current !== null) {
+        window.clearInterval(recordingTimerRef.current);
+      }
+    };
+  }, []);
+
   async function sendPrompt() {
     const question = prompt.trim();
 
-    if (!question || isSending) {
+    if (
+      !question ||
+      isSending ||
+      isRecording ||
+      isTranscribing ||
+      submitPendingRef.current
+    ) {
       return;
     }
 
+    submitPendingRef.current = true;
     shouldAutoScrollRef.current = true;
-    setPrompt("");
     clearError();
-    await sendMessage({ text: question });
+
+    try {
+      const requestId = crypto.randomUUID();
+      const ttsReady = speechPlaybackEnabled
+        ? await preparePlayback(requestId)
+        : false;
+
+      setPrompt("");
+      await sendMessage(
+        { text: question },
+        {
+          body: {
+            request_id: ttsReady ? requestId : null,
+            tts_enabled: ttsReady,
+          },
+        },
+      );
+    } catch {
+      stopPlayback();
+    } finally {
+      submitPendingRef.current = false;
+    }
+  }
+
+  function stopResponse() {
+    stopPlayback();
+    void stop();
   }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -106,6 +193,154 @@ export function AIChat() {
     ) {
       event.preventDefault();
       void sendPrompt();
+    }
+  }
+
+  function clearRecordingTimer() {
+    if (recordingTimerRef.current !== null) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  }
+
+  function releaseMicrophone() {
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+  }
+
+  function stopRecording() {
+    const recorder = mediaRecorderRef.current;
+
+    if (!recorder || recorder.state === "inactive") {
+      return;
+    }
+
+    shouldTranscribeRef.current = true;
+    recorder.stop();
+  }
+
+  async function transcribeRecording(audio: Blob) {
+    setIsTranscribing(true);
+    setSpeechError(null);
+
+    try {
+      const result = await transcribeAudio(audio);
+      const text = result.text.trim();
+
+      if (!text) {
+        setSpeechError("没有识别到语音内容，请重新录制");
+        return;
+      }
+
+      setPrompt((current) => {
+        const existing = current.trim();
+        return existing ? `${existing} ${text}` : text;
+      });
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    } catch (error) {
+      setSpeechError(
+        error instanceof Error ? error.message : "语音识别失败，请稍后重试",
+      );
+    } finally {
+      setIsTranscribing(false);
+    }
+  }
+
+  async function startRecording() {
+    if (isSending || isTranscribing) {
+      return;
+    }
+
+    setSpeechError(null);
+
+    if (
+      typeof MediaRecorder === "undefined" ||
+      !navigator.mediaDevices?.getUserMedia
+    ) {
+      setSpeechError("当前浏览器不支持录音，请使用最新版 Chrome、Edge 或 Safari");
+      return;
+    }
+
+    let stream: MediaStream | null = null;
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+
+      const mimeType = RECORDING_MIME_TYPES.find((type) =>
+        MediaRecorder.isTypeSupported(type),
+      );
+      const recorder = new MediaRecorder(
+        stream,
+        mimeType ? { mimeType } : undefined,
+      );
+
+      mediaStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      audioChunksRef.current = [];
+      shouldTranscribeRef.current = false;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const shouldTranscribe = shouldTranscribeRef.current;
+        shouldTranscribeRef.current = false;
+        mediaRecorderRef.current = null;
+        setIsRecording(false);
+        clearRecordingTimer();
+        releaseMicrophone();
+
+        if (!shouldTranscribe) {
+          return;
+        }
+
+        const audio = new Blob(audioChunksRef.current, {
+          type:
+            recorder.mimeType ||
+            audioChunksRef.current[0]?.type ||
+            "audio/webm",
+        });
+        audioChunksRef.current = [];
+
+        if (audio.size === 0) {
+          setSpeechError("没有录制到音频，请重新尝试");
+          return;
+        }
+
+        void transcribeRecording(audio);
+      };
+
+      recorder.onerror = () => {
+        setSpeechError("录音过程中发生错误，请重新尝试");
+      };
+
+      recorder.start(1_000);
+      setRecordingSeconds(0);
+      setIsRecording(true);
+
+      const startedAt = Date.now();
+      recordingTimerRef.current = window.setInterval(() => {
+        const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1_000);
+        setRecordingSeconds(elapsedSeconds);
+
+        if (elapsedSeconds >= MAX_RECORDING_SECONDS) {
+          stopRecording();
+        }
+      }, 1_000);
+    } catch (error) {
+      stream?.getTracks().forEach((track) => track.stop());
+      releaseMicrophone();
+      clearRecordingTimer();
+      setIsRecording(false);
+      setSpeechError(getRecordingErrorMessage(error));
     }
   }
 
@@ -200,9 +435,44 @@ export function AIChat() {
         className="shrink-0 border-t border-border bg-card p-3 sm:p-4"
         onSubmit={handleSubmit}
       >
-        {error ? (
+        {error || speechError || speechPlaybackError ? (
           <p className="mb-2 px-1 text-sm text-destructive" role="alert">
-            {error.message || "发送失败，请稍后重试"}
+            {speechError ||
+              speechPlaybackError ||
+              error?.message ||
+              "发送失败，请稍后重试"}
+          </p>
+        ) : null}
+
+        {isRecording || isTranscribing ? (
+          <p
+            className={cn(
+              "mb-2 px-1 text-xs",
+              isRecording ? "text-destructive" : "text-muted-foreground",
+            )}
+            aria-live="polite"
+          >
+            {isRecording
+              ? `正在录音 ${formatDuration(recordingSeconds)}，点击红色按钮结束`
+              : "正在识别语音..."}
+          </p>
+        ) : null}
+
+        {speechPlaybackStatus !== "idle" ? (
+          <p
+            className="mb-2 flex items-center gap-1.5 px-1 text-xs text-muted-foreground"
+            aria-live="polite"
+          >
+            {speechPlaybackStatus === "speaking" ? (
+              <Volume2 className="size-3.5 animate-pulse" />
+            ) : (
+              <LoaderCircle className="size-3.5 animate-spin" />
+            )}
+            {speechPlaybackStatus === "connecting"
+              ? "正在连接语音服务..."
+              : speechPlaybackStatus === "waiting"
+                ? "等待语音合成..."
+                : "正在朗读回答..."}
           </p>
         ) : null}
 
@@ -217,15 +487,66 @@ export function AIChat() {
             aria-label="输入问题"
             maxLength={20_000}
             rows={1}
-            disabled={isSending}
+            disabled={isSending || speechPlaybackStatus === "connecting"}
             autoFocus
           />
+          <Button
+            type="button"
+            size="icon-lg"
+            variant={speechPlaybackEnabled ? "secondary" : "ghost"}
+            className={cn(
+              "mb-0.5 rounded-xl",
+              speechPlaybackStatus === "speaking" && "animate-pulse",
+            )}
+            onClick={() => void toggleSpeechPlayback()}
+            aria-label={
+              speechPlaybackEnabled ? "关闭自动朗读" : "开启自动朗读"
+            }
+            aria-pressed={speechPlaybackEnabled}
+            title={
+              speechPlaybackEnabled ? "关闭自动朗读" : "开启自动朗读"
+            }
+          >
+            {speechPlaybackEnabled ? <Volume2 /> : <VolumeX />}
+          </Button>
+          <Button
+            type="button"
+            size="icon-lg"
+            variant={isRecording ? "destructive" : "ghost"}
+            className={cn(
+              "mb-0.5 rounded-xl",
+              isRecording && "animate-pulse",
+            )}
+            disabled={
+              isSending ||
+              isTranscribing ||
+              speechPlaybackStatus === "connecting"
+            }
+            onClick={isRecording ? stopRecording : () => void startRecording()}
+            aria-label={isRecording ? "停止录音" : "开始录音"}
+            aria-pressed={isRecording}
+            title={isRecording ? "停止录音" : "语音输入"}
+          >
+            {isTranscribing ? (
+              <LoaderCircle className="animate-spin" />
+            ) : isRecording ? (
+              <Square className="size-3.5 fill-current" />
+            ) : (
+              <Mic />
+            )}
+          </Button>
           <Button
             type={isSending ? "button" : "submit"}
             size="icon-lg"
             className="mb-0.5 rounded-xl"
-            disabled={!isSending && !prompt.trim()}
-            onClick={isSending ? () => void stop() : undefined}
+            disabled={
+              !isSending &&
+              (!prompt.trim() ||
+                isRecording ||
+                isTranscribing ||
+                speechPlaybackStatus === "connecting")
+            }
+            onClick={isSending ? stopResponse : undefined}
             aria-label={isSending ? "停止生成" : "发送问题"}
           >
             {isSending ? (
@@ -238,4 +559,24 @@ export function AIChat() {
       </form>
     </div>
   );
+}
+
+function formatDuration(seconds: number) {
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`;
+}
+
+function getRecordingErrorMessage(error: unknown) {
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError") {
+      return "麦克风权限被拒绝，请在浏览器设置中允许访问麦克风";
+    }
+
+    if (error.name === "NotFoundError") {
+      return "没有找到可用的麦克风";
+    }
+  }
+
+  return error instanceof Error ? error.message : "无法启动录音，请稍后重试";
 }

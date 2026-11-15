@@ -27,6 +27,10 @@ class HttpService {
     return this.request<T>(path, { ...options, method: "POST", body });
   }
 
+  postForm<T>(path: string, body: FormData, options?: RequestOptions) {
+    return this.request<T>(path, { ...options, method: "POST", body });
+  }
+
   put<T>(path: string, body?: unknown, options?: RequestOptions) {
     return this.request<T>(path, { ...options, method: "PUT", body });
   }
@@ -46,8 +50,9 @@ class HttpService {
     const { body, headers: customHeaders, ...requestOptions } = options;
     const headers = new Headers(customHeaders);
     const hasBody = body !== undefined;
+    const isFormData = body instanceof FormData;
 
-    if (hasBody && !headers.has("content-type")) {
+    if (hasBody && !isFormData && !headers.has("content-type")) {
       headers.set("content-type", "application/json");
     }
 
@@ -58,7 +63,11 @@ class HttpService {
         ...requestOptions,
         headers,
         credentials: "same-origin",
-        body: hasBody ? JSON.stringify(body) : undefined,
+        body: hasBody
+          ? isFormData
+            ? body
+            : JSON.stringify(body)
+          : undefined,
       });
     } catch (error) {
       throw new HttpError("暂时无法连接服务，请稍后重试", 0, error);
