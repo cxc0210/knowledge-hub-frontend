@@ -5,9 +5,12 @@ import { DefaultChatTransport, type UIMessage } from "ai";
 import {
   Bot,
   LoaderCircle,
+  MessageSquare,
   Mic,
+  Plus,
   Send,
   Square,
+  Trash2,
   UserRound,
   Volume2,
   VolumeX,
@@ -15,7 +18,9 @@ import {
 import {
   FormEvent,
   KeyboardEvent,
+  useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -26,6 +31,14 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { useSpeechPlayback } from "@/hooks/use-speech-playback";
 import type { EmailAction } from "@/lib/ai-actions";
+import {
+  createAIConversation,
+  deleteAIConversation,
+  listAllAIConversationMessages,
+  listAllAIConversations,
+  type AIConversation,
+  type AIConversationMessage,
+} from "@/lib/ai-conversations";
 import { transcribeAudio } from "@/lib/speech";
 import { cn } from "@/lib/utils";
 
@@ -36,6 +49,8 @@ const RECORDING_MIME_TYPES = [
   "audio/mp4",
   "audio/ogg;codecs=opus",
 ];
+const ACTIVE_CONVERSATION_STORAGE_KEY =
+  "knowledge-hub:active-conversation-id";
 
 type AIChatDataParts = {
   "email-approval": EmailAction;
@@ -56,26 +71,28 @@ const INITIAL_MESSAGES: AIChatMessage[] = [
   },
 ];
 
-const CHAT_TRANSPORT = new DefaultChatTransport<AIChatMessage>({
-  api: "/api/ai/chat/stream",
-  credentials: "same-origin",
-  prepareSendMessagesRequest({ messages, body }) {
-    let prompt = "";
+function createChatTransport(conversationId: string) {
+  return new DefaultChatTransport<AIChatMessage>({
+    api: `/api/ai/conversations/${encodeURIComponent(conversationId)}/chat/stream`,
+    credentials: "same-origin",
+    prepareSendMessagesRequest({ messages, body }) {
+      let prompt = "";
 
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
 
-      if (message.role === "user") {
-        prompt = message.parts
-          .map((part) => (part.type === "text" ? part.text : ""))
-          .join("");
-        break;
+        if (message.role === "user") {
+          prompt = message.parts
+            .map((part) => (part.type === "text" ? part.text : ""))
+            .join("");
+          break;
+        }
       }
-    }
 
-    return { body: { ...body, prompt } };
-  },
-});
+      return { body: { ...body, prompt } };
+    },
+  });
+}
 
 function getMessageText(message: AIChatMessage) {
   return message.parts
@@ -83,7 +100,434 @@ function getMessageText(message: AIChatMessage) {
     .join("");
 }
 
+function toAIChatMessages(messages: AIConversationMessage[]) {
+  if (messages.length === 0) {
+    return INITIAL_MESSAGES;
+  }
+
+  return messages.map<AIChatMessage>((message) => ({
+    id: message.id,
+    role: message.role,
+    parts: [{ type: "text", text: message.content }],
+  }));
+}
+
+function getErrorText(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function formatConversationTime(value: string | null) {
+  if (!value) {
+    return "暂无消息";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "时间未知";
+  }
+
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
 export function AIChat() {
+  const [conversations, setConversations] = useState<AIConversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<
+    string | null
+  >(null);
+  const [initialMessages, setInitialMessages] = useState<
+    AIChatMessage[] | null
+  >(null);
+  const [isLoadingConversations, setIsLoadingConversations] = useState(true);
+  const [isCreatingConversation, setIsCreatingConversation] = useState(false);
+  const [deletingConversationId, setDeletingConversationId] = useState<
+    string | null
+  >(null);
+  const [busyConversationId, setBusyConversationId] = useState<string | null>(
+    null,
+  );
+  const [conversationError, setConversationError] = useState<string | null>(
+    null,
+  );
+  const [messageError, setMessageError] = useState<string | null>(null);
+  const [historyReloadKey, setHistoryReloadKey] = useState(0);
+
+  const rememberActiveConversation = useCallback((conversationId: string) => {
+    setActiveConversationId(conversationId);
+    window.localStorage.setItem(
+      ACTIVE_CONVERSATION_STORAGE_KEY,
+      conversationId,
+    );
+  }, []);
+
+  const refreshConversationList = useCallback(async () => {
+    const items = await listAllAIConversations();
+    setConversations(items);
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let isActive = true;
+
+    async function loadConversations() {
+      setIsLoadingConversations(true);
+      setConversationError(null);
+
+      try {
+        const items = await listAllAIConversations(controller.signal);
+        if (!isActive) {
+          return;
+        }
+
+        setConversations(items);
+        const storedConversationId = window.localStorage.getItem(
+          ACTIVE_CONVERSATION_STORAGE_KEY,
+        );
+        const nextConversation =
+          items.find((item) => item.id === storedConversationId) ?? items[0];
+
+        if (nextConversation) {
+          rememberActiveConversation(nextConversation.id);
+        } else {
+          setActiveConversationId(null);
+          window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+        }
+      } catch (error) {
+        if (isActive && !controller.signal.aborted) {
+          setConversationError(
+            getErrorText(error, "会话列表加载失败，请稍后重试"),
+          );
+        }
+      } finally {
+        if (isActive) {
+          setIsLoadingConversations(false);
+        }
+      }
+    }
+
+    void loadConversations();
+
+    return () => {
+      isActive = false;
+      controller.abort();
+    };
+  }, [rememberActiveConversation]);
+
+  useEffect(() => {
+    if (!activeConversationId) {
+      setInitialMessages(null);
+      setMessageError(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    let isActive = true;
+    setInitialMessages(null);
+    setMessageError(null);
+
+    async function loadMessages() {
+      try {
+        const items = await listAllAIConversationMessages(
+          activeConversationId!,
+          controller.signal,
+        );
+        if (isActive) {
+          setInitialMessages(toAIChatMessages(items));
+        }
+      } catch (error) {
+        if (isActive && !controller.signal.aborted) {
+          setMessageError(
+            getErrorText(error, "聊天记录加载失败，请稍后重试"),
+          );
+        }
+      }
+    }
+
+    void loadMessages();
+
+    return () => {
+      isActive = false;
+      controller.abort();
+    };
+  }, [activeConversationId, historyReloadKey]);
+
+  async function handleCreateConversation() {
+    if (busyConversationId || isCreatingConversation) {
+      return;
+    }
+
+    setIsCreatingConversation(true);
+    setConversationError(null);
+
+    try {
+      const conversation = await createAIConversation();
+      setConversations((current) => [
+        conversation,
+        ...current.filter((item) => item.id !== conversation.id),
+      ]);
+      rememberActiveConversation(conversation.id);
+    } catch (error) {
+      setConversationError(getErrorText(error, "新建会话失败，请稍后重试"));
+    } finally {
+      setIsCreatingConversation(false);
+    }
+  }
+
+  async function handleDeleteConversation(conversation: AIConversation) {
+    if (
+      busyConversationId ||
+      deletingConversationId ||
+      !window.confirm(`确定删除会话“${conversation.title}”吗？`)
+    ) {
+      return;
+    }
+
+    setDeletingConversationId(conversation.id);
+    setConversationError(null);
+
+    try {
+      await deleteAIConversation(conversation.id);
+      const remaining = conversations.filter(
+        (item) => item.id !== conversation.id,
+      );
+      setConversations(remaining);
+
+      if (activeConversationId === conversation.id) {
+        const nextConversation = remaining[0];
+        if (nextConversation) {
+          rememberActiveConversation(nextConversation.id);
+        } else {
+          setActiveConversationId(null);
+          setInitialMessages(null);
+          window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+        }
+      }
+    } catch (error) {
+      setConversationError(getErrorText(error, "删除会话失败，请稍后重试"));
+    } finally {
+      setDeletingConversationId(null);
+    }
+  }
+
+  const handleBusyChange = useCallback(
+    (conversationId: string, isBusy: boolean) => {
+      setBusyConversationId((current) => {
+        if (isBusy) {
+          return conversationId;
+        }
+        return current === conversationId ? null : current;
+      });
+    },
+    [],
+  );
+
+  const handleConversationChanged = useCallback(async () => {
+    try {
+      await refreshConversationList();
+    } catch {
+      // The message is already visible. A later page load can refresh its title.
+    }
+  }, [refreshConversationList]);
+
+  return (
+    <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] gap-3 lg:grid-cols-[260px_minmax(0,1fr)] lg:grid-rows-1">
+      <aside className="flex max-h-44 min-h-0 flex-col overflow-hidden rounded-2xl bg-card ring-1 ring-foreground/10 lg:max-h-none">
+        <div className="flex items-center justify-between border-b border-border px-3 py-3">
+          <div>
+            <strong className="block text-sm">会话</strong>
+            <span className="text-[11px] text-muted-foreground">
+              {conversations.length} 个会话
+            </span>
+          </div>
+          <Button
+            type="button"
+            size="icon"
+            variant="secondary"
+            className="rounded-xl"
+            disabled={Boolean(busyConversationId) || isCreatingConversation}
+            onClick={() => void handleCreateConversation()}
+            aria-label="新建会话"
+            title="新建会话"
+          >
+            {isCreatingConversation ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <Plus />
+            )}
+          </Button>
+        </div>
+
+        {conversationError ? (
+          <p className="px-3 pt-2 text-xs text-destructive" role="alert">
+            {conversationError}
+          </p>
+        ) : null}
+
+        <div className="table-scrollbar flex min-h-0 gap-2 overflow-auto p-2 lg:flex-1 lg:flex-col">
+          {isLoadingConversations ? (
+            <div className="flex min-w-52 items-center gap-2 rounded-xl bg-muted px-3 py-3 text-xs text-muted-foreground lg:min-w-0">
+              <LoaderCircle className="size-4 animate-spin" />
+              正在加载会话...
+            </div>
+          ) : conversations.length === 0 ? (
+            <button
+              type="button"
+              className="min-w-52 rounded-xl border border-dashed border-border px-3 py-4 text-left text-xs text-muted-foreground hover:bg-muted lg:min-w-0"
+              onClick={() => void handleCreateConversation()}
+            >
+              还没有会话，点击这里开始
+            </button>
+          ) : (
+            conversations.map((conversation) => {
+              const isActive = conversation.id === activeConversationId;
+              const isDeleting =
+                conversation.id === deletingConversationId;
+
+              return (
+                <div
+                  key={conversation.id}
+                  className={cn(
+                    "flex min-w-52 items-center rounded-xl transition-colors lg:min-w-0",
+                    isActive
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-muted/70 hover:bg-muted",
+                  )}
+                >
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 items-center gap-2.5 px-3 py-2.5 text-left"
+                    disabled={Boolean(busyConversationId)}
+                    onClick={() =>
+                      rememberActiveConversation(conversation.id)
+                    }
+                    aria-current={isActive ? "true" : undefined}
+                  >
+                    <MessageSquare className="size-4 shrink-0" />
+                    <span className="min-w-0 flex-1">
+                      <strong className="block truncate text-xs font-semibold">
+                        {conversation.title}
+                      </strong>
+                      <span
+                        className={cn(
+                          "block truncate text-[10px]",
+                          isActive
+                            ? "text-primary-foreground/65"
+                            : "text-muted-foreground",
+                        )}
+                      >
+                        {formatConversationTime(
+                          conversation.last_message_at,
+                        )}
+                      </span>
+                    </span>
+                  </button>
+                  <Button
+                    type="button"
+                    size="icon-sm"
+                    variant="ghost"
+                    className={cn(
+                      "mr-1 shrink-0 rounded-lg",
+                      isActive &&
+                        "text-primary-foreground hover:bg-white/10 hover:text-primary-foreground",
+                    )}
+                    disabled={Boolean(busyConversationId) || isDeleting}
+                    onClick={() =>
+                      void handleDeleteConversation(conversation)
+                    }
+                    aria-label={`删除会话${conversation.title}`}
+                    title="删除会话"
+                  >
+                    {isDeleting ? (
+                      <LoaderCircle className="animate-spin" />
+                    ) : (
+                      <Trash2 />
+                    )}
+                  </Button>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </aside>
+
+      <div className="flex min-h-0 min-w-0">
+        {activeConversationId && initialMessages ? (
+          <ConversationChat
+            key={activeConversationId}
+            conversationId={activeConversationId}
+            initialMessages={initialMessages}
+            onBusyChange={handleBusyChange}
+            onConversationChanged={handleConversationChanged}
+          />
+        ) : activeConversationId && messageError ? (
+          <div className="grid min-h-0 flex-1 place-items-center rounded-2xl bg-card p-6 text-center ring-1 ring-foreground/10">
+            <div>
+              <p className="text-sm text-destructive">{messageError}</p>
+              <Button
+                type="button"
+                variant="secondary"
+                className="mt-3"
+                onClick={() => setHistoryReloadKey((current) => current + 1)}
+              >
+                重新加载
+              </Button>
+            </div>
+          </div>
+        ) : activeConversationId ? (
+          <div className="grid min-h-0 flex-1 place-items-center rounded-2xl bg-card text-sm text-muted-foreground ring-1 ring-foreground/10">
+            <span className="flex items-center gap-2">
+              <LoaderCircle className="size-4 animate-spin" />
+              正在加载聊天记录...
+            </span>
+          </div>
+        ) : (
+          <div className="grid min-h-0 flex-1 place-items-center rounded-2xl bg-card p-6 text-center ring-1 ring-foreground/10">
+            <div>
+              <span className="mx-auto grid size-12 place-items-center rounded-2xl bg-accent text-accent-foreground">
+                <Bot className="size-5" />
+              </span>
+              <h2 className="mt-3 font-semibold">开始一个新会话</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                每个会话都会单独保存聊天记录。
+              </p>
+              <Button
+                type="button"
+                className="mt-4"
+                disabled={isCreatingConversation}
+                onClick={() => void handleCreateConversation()}
+              >
+                <Plus />
+                新建会话
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+type ConversationChatProps = {
+  conversationId: string;
+  initialMessages: AIChatMessage[];
+  onBusyChange: (conversationId: string, isBusy: boolean) => void;
+  onConversationChanged: () => Promise<void>;
+};
+
+function ConversationChat({
+  conversationId,
+  initialMessages,
+  onBusyChange,
+  onConversationChanged,
+}: ConversationChatProps) {
+  const chatTransport = useMemo(
+    () => createChatTransport(conversationId),
+    [conversationId],
+  );
   const [prompt, setPrompt] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
@@ -111,11 +555,20 @@ export function AIChat() {
   } = useSpeechPlayback();
   const { messages, sendMessage, status, error, stop, clearError } =
     useChat<AIChatMessage>({
-      messages: INITIAL_MESSAGES,
-      transport: CHAT_TRANSPORT,
+      id: conversationId,
+      messages: initialMessages,
+      transport: chatTransport,
       throttle: 45,
     });
   const isSending = status === "submitted" || status === "streaming";
+
+  useEffect(() => {
+    onBusyChange(conversationId, isSending);
+  }, [conversationId, isSending, onBusyChange]);
+
+  useEffect(() => {
+    return () => onBusyChange(conversationId, false);
+  }, [conversationId, onBusyChange]);
 
   useEffect(() => {
     if (shouldAutoScrollRef.current) {
@@ -180,6 +633,7 @@ export function AIChat() {
           },
         },
       );
+      await onConversationChanged();
     } catch {
       stopPlayback();
     } finally {
